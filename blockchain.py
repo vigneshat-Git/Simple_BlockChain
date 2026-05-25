@@ -235,6 +235,115 @@ class Blockchain:
 
 
 # ─────────────────────────────────────────────
+#  TRANSACTION-AWARE BLOCKCHAIN (simple upgrade)
+# ─────────────────────────────────────────────
+
+class TransactionBlockchain(Blockchain):
+    """
+    Simple upgrade that stores lists of tx dicts in block.data,
+    maintains a mempool and provides balance computation.
+    """
+    MINING_REWARD = 10.0
+
+    def __init__(self, miner_address: str = "COINBASE", silent: bool = False):
+        self.miner_address = miner_address
+        self._mempool = []  # list of Transaction-like dicts or Transaction objects
+        self._mempool_lock = threading.Lock()
+        super().__init__()
+        self._silent = silent
+
+    def submit_transaction(self, tx) -> bool:
+        """Validate basic transaction shape/signature if object provides verify()."""
+        # basic checks
+        if not hasattr(tx, 'amount') or not hasattr(tx, 'sender_address'):
+            if not isinstance(tx, dict):
+                if not self._silent:
+                    print("  ✗ Not a transaction-like object")
+                return False
+
+        amount = tx.amount if hasattr(tx, 'amount') else tx.get('amount', 0)
+        if amount <= 0:
+            if not self._silent:
+                print(f"  ✗ TX rejected: non-positive amount {amount}")
+            return False
+
+        # verify signature when possible
+        if hasattr(tx, 'verify'):
+            try:
+                if not tx.verify():
+                    if not self._silent:
+                        print(f"  ✗ TX rejected: invalid signature")
+                    return False
+            except Exception:
+                if not self._silent:
+                    print(f"  ✗ TX rejected: verification error")
+                return False
+
+        # check balance
+        sender = tx.sender_address if hasattr(tx, 'sender_address') else tx.get('sender_address')
+        if sender and self.balance_of(sender) < amount:
+            if not self._silent:
+                print(f"  ✗ TX rejected: insufficient balance have={self.balance_of(sender)} need={amount}")
+            return False
+
+        with self._mempool_lock:
+            self._mempool.append(tx)
+        if not self._silent:
+            print(f"  ✓ TX accepted into mempool amount={amount}")
+        return True
+
+    def pending_count(self) -> int:
+        with self._mempool_lock:
+            return len(self._mempool)
+
+    def mine_pending(self) -> Block:
+        """Bundle pending txs into a block with a coinbase reward and mine it."""
+        with self._mempool_lock:
+            pending = list(self._mempool)
+            self._mempool.clear()
+
+        # coinbase tx
+        coinbase = {
+            "tx_id": "COINBASE-" + self.latest_block.hash[:16],
+            "sender_address": "COINBASE",
+            "receiver_address": self.miner_address,
+            "amount": self.MINING_REWARD,
+            "timestamp": time.time(),
+            "sender_public_key": "",
+            "signature": "COINBASE",
+        }
+
+        tx_list = [coinbase] + [t.to_dict() if hasattr(t, 'to_dict') else t for t in pending]
+
+        if not self._silent:
+            print(f"  ⛏  Mining block with {len(pending)} tx(s) + 1 coinbase reward…")
+
+        return self.add_block(tx_list)
+
+    def balance_of(self, address: str) -> float:
+        balance = 0.0
+        for block in self.chain:
+            if not isinstance(block.data, list):
+                continue
+            for tx in block.data:
+                if tx.get('receiver_address') == address:
+                    balance += tx['amount']
+                if tx.get('sender_address') == address:
+                    balance -= tx['amount']
+        return balance
+
+    def transaction_history(self, address: str) -> List[Dict[str, Any]]:
+        history = []
+        for block in self.chain:
+            if not isinstance(block.data, list):
+                continue
+            for tx in block.data:
+                if tx.get('sender_address') == address or tx.get('receiver_address') == address:
+                    history.append({**tx, '_block': block.index})
+        return history
+
+
+# ─────────────────────────────────────────────
 #  P2P NETWORK
 # ─────────────────────────────────────────────
 
@@ -398,6 +507,8 @@ class P2PNode:
                     print(f"⚠️ Giving up on peer {peer} after {max_attempts} attempts")
                     self.known_peers_to_try.discard(peer)
                     attempts.pop(peer, None)
+                else:
+                    attempts[peer] = attempts.get(peer, 0) + 1
                     continue
 
                 success = self.connect_to_peer(peer)
